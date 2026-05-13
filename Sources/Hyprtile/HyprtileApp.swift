@@ -14,10 +14,6 @@ struct HyprtileApp: App {
         MenuBarExtra("Hyprtile", systemImage: controller.statusItemImageName) {
             MenuBarContent(controller: controller)
         }
-
-        Settings {
-            PreferencesView(controller: controller)
-        }
     }
 }
 
@@ -25,11 +21,22 @@ private struct MenuBarContent: View {
     @ObservedObject var controller: AppController
 
     var body: some View {
-        Button(controller.isEnabled ? "Disable" : "Enable") {
-            controller.setEnabled(!controller.isEnabled)
+        Button("About Hyprtile") {
+            controller.openAboutWindow()
         }
 
-        Text("Mode")
+        Button(controller.isCheckingForUpdates ? "Checking for Updates..." : "Check for Updates...") {
+            controller.checkForUpdates()
+        }
+        .disabled(controller.isCheckingForUpdates)
+
+        Divider()
+
+        Button(controller.pauseButtonTitle) {
+            controller.setPaused(!controller.isPaused)
+        }
+
+        Text("Layout")
             .font(.caption)
             .foregroundStyle(.secondary)
 
@@ -66,6 +73,10 @@ private struct MenuBarContent: View {
         Divider()
 
         Text("\(controller.managedWindowCount) managed windows")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+        Text("State: \(controller.runState.title)")
             .font(.caption)
             .foregroundStyle(.secondary)
 

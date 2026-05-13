@@ -9,7 +9,8 @@ Hyprtile is a macOS 15+ menu bar tiling window manager built with SwiftUI and Ap
 - Menu bar only app
 - Accessibility onboarding
 - Display-local BSP tiling
-- `Tiling`, `Pause`, and `Monocle` modes
+- `Tiling` and `Monocle` layouts
+- `Pause` / `Resume` state
 - Normal drag-and-drop window repositioning
 - Hold `Option` while dropping to force a top/bottom split
 - Middle mouse drag to resize splits
@@ -23,6 +24,8 @@ You can download packaged `.app` archives from GitHub Releases.
 2. Choose the asset for your Mac
 3. Unzip it and move `Hyprtile.app` into `Applications`
 4. Launch it once and grant `Accessibility`
+
+After install, use the menu bar items `About Hyprtile` and `Check for Updates...` to inspect the current version and pull the latest GitHub Release from inside the app.
 
 Release asset names:
 

@@ -17,16 +17,20 @@ final class LayoutEngine {
     }
 
     private(set) var sessions: [CGDirectDisplayID: DisplayLayoutState] = [:]
+    private var cachedRoots: [LayoutSnapshotKey: LayoutNode] = [:]
+    private var currentSnapshotKeys: [CGDirectDisplayID: LayoutSnapshotKey] = [:]
 
     func rebuildSessions(
         with windows: [ManagedWindow],
         displays: [DisplayDescriptor],
-        persistedSnapshots: [CGDirectDisplayID: PersistedLayoutNode] = [:]
+        persistedSnapshots: [LayoutSnapshotKey: PersistedLayoutNode] = [:]
     ) {
         let displaysByID = Dictionary(uniqueKeysWithValues: displays.map { ($0.displayID, $0) })
         let validDisplayIDs = Set(displaysByID.keys)
 
         sessions = sessions.filter { validDisplayIDs.contains($0.key) }
+        currentSnapshotKeys = currentSnapshotKeys.filter { validDisplayIDs.contains($0.key) }
+        cachedRoots = cachedRoots.filter { validDisplayIDs.contains($0.key.displayID) }
 
         for display in displays {
             if let session = sessions[display.displayID] {
@@ -45,20 +49,51 @@ final class LayoutEngine {
             let sessionWindows = windowsByDisplay[display.displayID] ?? []
             let focusedWindowID = sessionWindows.first(where: \.isFocused)?.id
             let orderedWindows = prioritizedWindows(sessionWindows)
+            let snapshotKey = LayoutSnapshotKey(
+                displayID: display.displayID,
+                windowIDs: orderedWindows.map(\.id)
+            )
 
             guard let session = sessions[display.displayID] else {
                 continue
             }
 
-            let restoredRoot = session.root ?? persistedSnapshots[display.displayID].flatMap(LayoutNode.restore(from:))
             session.visibleFrame = display.visibleFrame
             session.focusedWindowID = focusedWindowID
-            session.root = syncTree(
+
+            if let previousKey = currentSnapshotKeys[display.displayID],
+               previousKey != snapshotKey,
+               let currentRoot = session.root {
+                cachedRoots[previousKey] = currentRoot
+            }
+
+            guard !orderedWindows.isEmpty else {
+                session.root = nil
+                currentSnapshotKeys.removeValue(forKey: display.displayID)
+                continue
+            }
+
+            let restoredRoot: LayoutNode?
+            if currentSnapshotKeys[display.displayID] == snapshotKey {
+                restoredRoot = session.root
+            } else if let cachedRoot = cachedRoots[snapshotKey] {
+                restoredRoot = cachedRoot
+            } else {
+                restoredRoot = persistedSnapshots[snapshotKey].flatMap(LayoutNode.restore(from:))
+            }
+
+            let syncedRoot = syncTree(
                 existingRoot: restoredRoot,
                 windows: orderedWindows,
                 visibleFrame: display.visibleFrame,
                 focusedWindowID: focusedWindowID
             )
+            session.root = syncedRoot
+            currentSnapshotKeys[display.displayID] = snapshotKey
+
+            if let syncedRoot {
+                cachedRoots[snapshotKey] = syncedRoot
+            }
         }
     }
 
@@ -76,7 +111,7 @@ final class LayoutEngine {
             }
 
             switch mode {
-            case .tiling, .pause:
+            case .tiling:
                 assignFrames(node: root, rect: visibleFrame, windowsByID: windowsByID, storage: &results)
             case .monocle:
                 for windowID in root.orderedLeafIDs() {
@@ -92,13 +127,18 @@ final class LayoutEngine {
         sessions.values.compactMap(\.focusedWindowID)
     }
 
-    func persistedLayoutSnapshots() -> [CGDirectDisplayID: PersistedLayoutNode] {
-        Dictionary(uniqueKeysWithValues: sessions.compactMap { displayID, session in
-            guard let root = session.root else {
-                return nil
+    func persistedLayoutSnapshots() -> [LayoutSnapshotKey: PersistedLayoutNode] {
+        var snapshots = Dictionary(uniqueKeysWithValues: cachedRoots.map { ($0.key, $0.value.snapshot()) })
+
+        for (displayID, session) in sessions {
+            guard let snapshotKey = currentSnapshotKeys[displayID],
+                  let root = session.root else {
+                continue
             }
-            return (displayID, root.snapshot())
-        })
+            snapshots[snapshotKey] = root.snapshot()
+        }
+
+        return snapshots
     }
 
     func beginResize(
@@ -174,7 +214,13 @@ final class LayoutEngine {
                 continue
             }
 
-            _ = syncRatios(node: root, windowsByID: windowsByID, preferredWindowID: preferredWindowID)
+            let ancestorFrames = nodeFrames(root: root, rect: session.visibleFrame)
+            _ = syncRatios(
+                node: root,
+                ancestorFrames: ancestorFrames,
+                windowsByID: windowsByID,
+                preferredWindowID: preferredWindowID
+            )
         }
     }
 
@@ -274,6 +320,7 @@ final class LayoutEngine {
     @discardableResult
     private func syncRatios(
         node: LayoutNode,
+        ancestorFrames: [ObjectIdentifier: CGRect],
         windowsByID: [WindowID: ManagedWindow],
         preferredWindowID: WindowID?
     ) -> CGRect? {
@@ -284,12 +331,26 @@ final class LayoutEngine {
         guard let first = node.first,
               let second = node.second,
               let axis = node.axis,
-              let firstRect = syncRatios(node: first, windowsByID: windowsByID, preferredWindowID: preferredWindowID),
-              let secondRect = syncRatios(node: second, windowsByID: windowsByID, preferredWindowID: preferredWindowID) else {
+              let firstRect = syncRatios(
+                node: first,
+                ancestorFrames: ancestorFrames,
+                windowsByID: windowsByID,
+                preferredWindowID: preferredWindowID
+              ),
+              let secondRect = syncRatios(
+                node: second,
+                ancestorFrames: ancestorFrames,
+                windowsByID: windowsByID,
+                preferredWindowID: preferredWindowID
+              ) else {
             return nil
         }
 
         let combinedRect = firstRect.union(secondRect)
+        guard let ancestorFrame = ancestorFrames[ObjectIdentifier(node)] else {
+            return combinedRect
+        }
+
         switch axis {
         case .vertical:
             let dividerX: CGFloat
@@ -303,17 +364,19 @@ final class LayoutEngine {
                 windowsByID: windowsByID,
                 preferredWindowID: preferredWindowID
             )
+            let overlappingChildren = firstRect.maxX > secondRect.minX + 1
+            let firstPinnedToMinimum = abs(firstRect.width - minimumWidth(node: first, windowsByID: windowsByID)) <= 4
 
             if firstContainsFocused, !secondContainsFocused {
-                dividerX = firstRect.maxX
-            } else if secondContainsFocused, !firstContainsFocused {
+                dividerX = overlappingChildren && firstPinnedToMinimum ? secondRect.minX : firstRect.maxX
+            } else if secondContainsFocused {
                 dividerX = secondRect.minX
             } else {
-                dividerX = (firstRect.maxX + secondRect.minX) / 2
+                dividerX = secondRect.minX
             }
 
-            let rawRatio = (dividerX - combinedRect.minX) / max(combinedRect.width, 1)
-            let bounds = ratioBounds(for: node, ancestorFrame: combinedRect, windowsByID: windowsByID)
+            let rawRatio = (dividerX - ancestorFrame.minX) / max(ancestorFrame.width, 1)
+            let bounds = ratioBounds(for: node, ancestorFrame: ancestorFrame, windowsByID: windowsByID)
             node.ratio = min(bounds.upper, max(bounds.lower, rawRatio))
         case .horizontal:
             let dividerY: CGFloat
@@ -327,17 +390,19 @@ final class LayoutEngine {
                 windowsByID: windowsByID,
                 preferredWindowID: preferredWindowID
             )
+            let overlappingChildren = secondRect.maxY > firstRect.minY + 1
+            let secondPinnedToMinimum = abs(secondRect.height - minimumHeight(node: second, windowsByID: windowsByID)) <= 4
 
-            if firstContainsFocused, !secondContainsFocused {
+            if firstContainsFocused {
                 dividerY = firstRect.minY
             } else if secondContainsFocused, !firstContainsFocused {
-                dividerY = secondRect.maxY
+                dividerY = overlappingChildren && secondPinnedToMinimum ? firstRect.minY : secondRect.maxY
             } else {
-                dividerY = (firstRect.minY + secondRect.maxY) / 2
+                dividerY = firstRect.minY
             }
 
-            let rawRatio = (combinedRect.maxY - dividerY) / max(combinedRect.height, 1)
-            let bounds = ratioBounds(for: node, ancestorFrame: combinedRect, windowsByID: windowsByID)
+            let rawRatio = (ancestorFrame.maxY - dividerY) / max(ancestorFrame.height, 1)
+            let bounds = ratioBounds(for: node, ancestorFrame: ancestorFrame, windowsByID: windowsByID)
             node.ratio = min(bounds.upper, max(bounds.lower, rawRatio))
         }
 

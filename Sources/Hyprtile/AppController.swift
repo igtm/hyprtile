@@ -13,6 +13,8 @@ final class AppController: ObservableObject {
     @Published private(set) var permissionState: PermissionState
     @Published private(set) var managedWindowCount = 0
     @Published private(set) var launchAtLoginEnabled = false
+    @Published private(set) var isCheckingForUpdates = false
+    @Published private(set) var updateStatusText = "Update status: not checked yet."
 
     let settingsStore: SettingsStore
     let permissionMonitor: PermissionMonitor
@@ -20,6 +22,7 @@ final class AppController: ObservableObject {
     private let windowController = WindowController()
     private let layoutEngine = LayoutEngine()
     private let inputRouter = InputRouter()
+    private let updateManager = AppUpdateManager()
 
     private var didStart = false
     private var refreshWorkItem: DispatchWorkItem?
@@ -30,14 +33,19 @@ final class AppController: ObservableObject {
     private var workspaceObserverTokens: [NSObjectProtocol] = []
     private var applicationObservers: [pid_t: AXObserver] = [:]
     private var externalChangeTimer: Timer?
-    private var settingsWindow: NSWindow?
+    private var settingsWindowController: NSWindowController?
+    private var aboutWindowController: NSWindowController?
 
     private var activeMove: MoveOperation?
     private var activeResize: ResizeOperation?
     private var externalMove: ExternalMoveOperation?
 
-    var isEnabled: Bool {
-        settingsStore.isEnabled
+    var runState: AppRunState {
+        settingsStore.runState
+    }
+
+    var isPaused: Bool {
+        runState == .paused
     }
 
     var mode: AppMode {
@@ -45,7 +53,7 @@ final class AppController: ObservableObject {
     }
 
     var canTile: Bool {
-        permissionState.accessibilityGranted && isEnabled
+        permissionState.accessibilityGranted
     }
 
     var statusItemImageName: String {
@@ -53,15 +61,13 @@ final class AppController: ObservableObject {
             return "exclamationmark.triangle"
         }
 
-        guard isEnabled else {
+        guard !isPaused else {
             return "pause.circle"
         }
 
         switch mode {
         case .tiling:
             return "rectangle.split.3x1"
-        case .pause:
-            return "pause.rectangle"
         case .monocle:
             return "square.on.square"
         }
@@ -70,7 +76,9 @@ final class AppController: ObservableObject {
     var permissionStatusText: String {
         switch permissionState.accessibilityGranted {
         case true:
-            return "Accessibility granted. Middle-button drag enabled in this build."
+            return isPaused
+                ? "Accessibility granted. Hyprtile is paused."
+                : "Accessibility granted. Hyprtile is active."
         case false:
             return "Accessibility permission required"
         }
@@ -78,6 +86,18 @@ final class AppController: ObservableObject {
 
     var launchAtLoginStatusText: String {
         launchAtLoginEnabled ? "Enabled" : "Not active"
+    }
+
+    var appVersionDisplayString: String {
+        AppMetadata.versionDisplayString
+    }
+
+    var appBundleIdentifier: String {
+        AppMetadata.bundleIdentifier
+    }
+
+    var pauseButtonTitle: String {
+        runState.actionTitle
     }
 
     private var isInteracting: Bool {
@@ -112,7 +132,7 @@ final class AppController: ObservableObject {
                     "Permission update accessibility=\(newState.accessibilityGranted, privacy: .public) inputMonitoring=\(newState.inputMonitoringGranted, privacy: .public)"
                 )
 
-                if newState.accessibilityGranted, isEnabled {
+                if newState.accessibilityGranted, !isPaused {
                     inputRouter.install()
                 } else {
                     inputRouter.uninstall()
@@ -158,17 +178,17 @@ final class AppController: ObservableObject {
         }
     }
 
-    func setEnabled(_ enabled: Bool) {
-        settingsStore.isEnabled = enabled
-        logger.info("Set enabled=\(enabled, privacy: .public)")
+    func setPaused(_ paused: Bool) {
+        settingsStore.runState = paused ? .paused : .active
+        logger.info("Set paused=\(paused, privacy: .public)")
 
-        if !enabled {
+        if paused {
             inputRouter.uninstall()
         } else if permissionState.accessibilityGranted {
             inputRouter.install()
         }
 
-        scheduleRefresh(reason: "toggle enabled", immediate: true)
+        scheduleRefresh(reason: paused ? "pause" : "resume", immediate: true)
     }
 
     func setMode(_ mode: AppMode) {
@@ -187,45 +207,103 @@ final class AppController: ObservableObject {
     }
 
     func openSettings() {
-        let window: NSWindow
+        let settingsWindowController = configuredSettingsWindowController()
+        guard let window = settingsWindowController.window else {
+            return
+        }
 
-        if let settingsWindow {
-            window = settingsWindow
+        logger.info("Opening preferences window")
+        DispatchQueue.main.async {
             if let hostingController = window.contentViewController as? NSHostingController<PreferencesView> {
                 hostingController.rootView = PreferencesView(controller: self)
             }
-        } else {
-            let hostingController = NSHostingController(rootView: PreferencesView(controller: self))
-            let settingsWindow = NSWindow(contentViewController: hostingController)
-            settingsWindow.title = "Hyprtile Preferences"
-            settingsWindow.styleMask = [.titled, .closable, .miniaturizable]
-            settingsWindow.setContentSize(NSSize(width: 520, height: 420))
-            settingsWindow.isReleasedWhenClosed = false
-            settingsWindow.center()
-            settingsWindow.collectionBehavior = [.moveToActiveSpace]
-            self.settingsWindow = settingsWindow
-            window = settingsWindow
+
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+
+            NSRunningApplication.current.activate(options: [.activateAllWindows])
+            NSApp.activate(ignoringOtherApps: true)
+            window.orderFrontRegardless()
+            window.makeMain()
+            window.makeKey()
+        }
+    }
+
+    func openAboutWindow() {
+        let aboutWindowController = configuredAboutWindowController()
+        guard let window = aboutWindowController.window else {
+            return
         }
 
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        logger.info("Opening about window")
+        DispatchQueue.main.async {
+            if let hostingController = window.contentViewController as? NSHostingController<AboutView> {
+                hostingController.rootView = AboutView(controller: self)
+            }
+
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+
+            NSRunningApplication.current.activate(options: [.activateAllWindows])
+            NSApp.activate(ignoringOtherApps: true)
+            window.orderFrontRegardless()
+            window.makeMain()
+            window.makeKey()
+        }
+    }
+
+    func closeAboutWindow() {
+        aboutWindowController?.close()
+    }
+
+    func checkForUpdates() {
+        guard !isCheckingForUpdates else {
+            return
+        }
+
+        isCheckingForUpdates = true
+        updateStatusText = "Update status: checking GitHub Releases..."
+
+        Task { @MainActor in
+            do {
+                let availability = try await updateManager.checkForUpdates()
+                isCheckingForUpdates = false
+
+                switch availability {
+                case let .upToDate(release):
+                    updateStatusText = "Update status: \(AppMetadata.shortVersion) is current."
+                    presentInformationalAlert(
+                        title: "Hyprtile Is Up to Date",
+                        message: "Installed version \(AppMetadata.versionDisplayString) matches the latest release \(release.tagName)."
+                    )
+                case let .updateAvailable(release, asset):
+                    updateStatusText = "Update status: \(release.tagName) is available."
+                    presentUpdateAlert(release: release, asset: asset)
+                }
+            } catch {
+                isCheckingForUpdates = false
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                updateStatusText = "Update status: check failed."
+                presentInformationalAlert(
+                    title: "Update Check Failed",
+                    message: message
+                )
+            }
+        }
+    }
+
+    func openReleasesPage() {
+        NSWorkspace.shared.open(AppMetadata.releasesPageURL)
     }
 
     func retileNow() {
-        let manualMode: AppMode = switch mode {
-        case .pause:
-            .tiling
-        case .tiling:
-            .tiling
-        case .monocle:
-            .monocle
-        }
-
         scheduleRefresh(
             reason: "manual retile",
             immediate: true,
             rebuildTree: true,
-            manualMode: manualMode
+            manualMode: mode
         )
     }
 
@@ -257,6 +335,113 @@ final class AppController: ObservableObject {
 
         settingsStore.attemptedLaunchAtLogin = true
         launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+    }
+
+    private func configuredSettingsWindowController() -> NSWindowController {
+        if let settingsWindowController {
+            return settingsWindowController
+        }
+
+        let hostingController = NSHostingController(rootView: PreferencesView(controller: self))
+        let settingsWindow = NSWindow(contentViewController: hostingController)
+        settingsWindow.title = "Hyprtile Preferences"
+        settingsWindow.styleMask = [.titled, .closable, .miniaturizable]
+        settingsWindow.setContentSize(NSSize(width: 520, height: 420))
+        settingsWindow.isReleasedWhenClosed = false
+        settingsWindow.hidesOnDeactivate = false
+        settingsWindow.isExcludedFromWindowsMenu = false
+        settingsWindow.tabbingMode = .disallowed
+        settingsWindow.center()
+        settingsWindow.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+
+        let settingsWindowController = NSWindowController(window: settingsWindow)
+        self.settingsWindowController = settingsWindowController
+        return settingsWindowController
+    }
+
+    private func configuredAboutWindowController() -> NSWindowController {
+        if let aboutWindowController {
+            return aboutWindowController
+        }
+
+        let hostingController = NSHostingController(rootView: AboutView(controller: self))
+        let aboutWindow = NSWindow(contentViewController: hostingController)
+        aboutWindow.title = "About \(AppMetadata.appName)"
+        aboutWindow.styleMask = [.titled, .closable, .miniaturizable]
+        aboutWindow.setContentSize(NSSize(width: 420, height: 240))
+        aboutWindow.isReleasedWhenClosed = false
+        aboutWindow.hidesOnDeactivate = false
+        aboutWindow.isExcludedFromWindowsMenu = false
+        aboutWindow.tabbingMode = .disallowed
+        aboutWindow.center()
+        aboutWindow.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+
+        let aboutWindowController = NSWindowController(window: aboutWindow)
+        self.aboutWindowController = aboutWindowController
+        return aboutWindowController
+    }
+
+    private func presentUpdateAlert(release: GitHubRelease, asset: GitHubReleaseAsset) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Update Available"
+        alert.informativeText = """
+        \(release.tagName) is available for this Mac.
+
+        Hyprtile will download \(asset.name), replace the current app, and relaunch itself.
+
+        Until Hyprtile is signed with a stable Developer ID certificate, macOS may ask you to re-enable Accessibility after an update.
+        """
+        alert.addButton(withTitle: "Install Update")
+        alert.addButton(withTitle: "Later")
+        alert.addButton(withTitle: "Open Release Page")
+
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        switch response {
+        case .alertFirstButtonReturn:
+            installUpdate(release: release, asset: asset)
+        case .alertThirdButtonReturn:
+            NSWorkspace.shared.open(release.htmlURL)
+        default:
+            return
+        }
+    }
+
+    private func installUpdate(release: GitHubRelease, asset: GitHubReleaseAsset) {
+        guard !isCheckingForUpdates else {
+            return
+        }
+
+        isCheckingForUpdates = true
+        updateStatusText = "Update status: downloading \(release.tagName)..."
+
+        Task { @MainActor in
+            do {
+                try await updateManager.installUpdate(release: release, asset: asset)
+            } catch {
+                isCheckingForUpdates = false
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                updateStatusText = "Update status: install failed."
+                presentInformationalAlert(
+                    title: "Update Install Failed",
+                    message: message
+                )
+            }
+        }
+    }
+
+    private func presentInformationalAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func registerWorkspaceObservers() {
@@ -399,13 +584,13 @@ final class AppController: ObservableObject {
 
         persistLayoutSnapshots()
 
-        guard isEnabled else {
+        guard !isPaused || manualMode != nil else {
             inputRouter.uninstall()
-            logger.debug("Skipping apply because tiling is disabled")
+            logger.debug("Skipping apply because Hyprtile is paused")
             return
         }
 
-        if permissionState.accessibilityGranted {
+        if permissionState.accessibilityGranted, !isPaused {
             inputRouter.install()
         } else {
             inputRouter.uninstall()
@@ -413,10 +598,6 @@ final class AppController: ObservableObject {
 
         let effectiveMode = manualMode ?? mode
         switch effectiveMode {
-        case .pause where manualMode == nil:
-            return
-        case .pause:
-            applyFrames(layoutEngine.frames(for: .tiling, displays: displays, windowsByID: windowsByID), windowsByID: windowsByID, mode: .tiling)
         case .tiling:
             applyFrames(layoutEngine.frames(for: .tiling, displays: displays, windowsByID: windowsByID), windowsByID: windowsByID, mode: .tiling)
         case .monocle:
@@ -534,7 +715,7 @@ final class AppController: ObservableObject {
     private func reconcileExternalWindowChanges() {
         guard didStart,
               permissionState.accessibilityGranted,
-              isEnabled,
+              !isPaused,
               mode == .tiling,
               !visibleWindowsByID.isEmpty else {
             return
@@ -741,6 +922,7 @@ private extension AppController {
 
     func automaticExternalMoveOperation(from liveWindows: [ManagedWindow]) -> ExternalMoveOperation? {
         guard mode == .tiling,
+              !isPaused,
               activeMove == nil,
               activeResize == nil,
               externalMove == nil,
@@ -770,6 +952,7 @@ private extension AppController {
 
     func shouldDeferAutomaticRefreshWhileDragging(liveWindows: [ManagedWindow]) -> Bool {
         guard mode == .tiling,
+              !isPaused,
               activeMove == nil,
               activeResize == nil,
               externalMove == nil,
@@ -851,7 +1034,7 @@ private extension AppController {
 @MainActor
 extension AppController: InputRouterDelegate {
     func inputRouter(_ router: InputRouter, windowAt point: CGPoint) -> ManagedWindow? {
-        guard permissionState.accessibilityGranted, isEnabled else {
+        guard permissionState.accessibilityGranted, !isPaused else {
             return nil
         }
 

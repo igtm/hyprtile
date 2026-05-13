@@ -7,8 +7,11 @@ struct PreferencesView: View {
         Form {
             Section("Status") {
                 LabeledContent("Managed windows", value: "\(controller.managedWindowCount)")
-                LabeledContent("Mode", value: controller.mode.title)
+                LabeledContent("State", value: controller.runState.title)
+                LabeledContent("Layout", value: controller.mode.title)
                 LabeledContent("Launch at Login", value: controller.launchAtLoginStatusText)
+                LabeledContent("Version", value: controller.appVersionDisplayString)
+                LabeledContent("Updates", value: controller.updateStatusText)
             }
 
             Section("Permissions") {
@@ -29,8 +32,8 @@ struct PreferencesView: View {
             }
 
             Section("Behavior") {
-                Button(controller.isEnabled ? "Disable tiling" : "Enable tiling") {
-                    controller.setEnabled(!controller.isEnabled)
+                Button(controller.pauseButtonTitle) {
+                    controller.setPaused(!controller.isPaused)
                 }
 
                 ModeButtons(controller: controller)
@@ -38,6 +41,15 @@ struct PreferencesView: View {
             }
 
             Section("Actions") {
+                Button("About Hyprtile") {
+                    controller.openAboutWindow()
+                }
+
+                Button(controller.isCheckingForUpdates ? "Checking for Updates..." : "Check for Updates...") {
+                    controller.checkForUpdates()
+                }
+                .disabled(controller.isCheckingForUpdates)
+
                 Button("Retile Now") {
                     controller.retileNow()
                 }

@@ -2,22 +2,83 @@ import AppKit
 
 enum AppMode: String, CaseIterable {
     case tiling
-    case pause
     case monocle
 
     var title: String {
         switch self {
         case .tiling:
             "Tiling"
-        case .pause:
-            "Pause"
         case .monocle:
             "Monocle"
         }
     }
 }
 
+enum AppRunState: String, Codable {
+    case active
+    case paused
+
+    var title: String {
+        switch self {
+        case .active:
+            "Active"
+        case .paused:
+            "Paused"
+        }
+    }
+
+    var actionTitle: String {
+        switch self {
+        case .active:
+            "Pause"
+        case .paused:
+            "Resume"
+        }
+    }
+}
+
 typealias WindowID = String
+
+struct LayoutSnapshotKey: Hashable {
+    let displayID: CGDirectDisplayID
+    let windowIDs: [WindowID]
+
+    private static let windowSeparator = "\u{1F}"
+
+    init(displayID: CGDirectDisplayID, windowIDs: some Sequence<WindowID>) {
+        self.displayID = displayID
+        self.windowIDs = Array(Set(windowIDs)).sorted()
+    }
+
+    init?(storageKey: String) {
+        let parts = storageKey.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let displayPart = parts.first,
+              let displayID = UInt32(displayPart) else {
+            return nil
+        }
+
+        let windowIDs: [WindowID]
+        if parts.count == 2 {
+            windowIDs = parts[1]
+                .split(separator: Character(Self.windowSeparator), omittingEmptySubsequences: true)
+                .map(String.init)
+                .sorted()
+        } else {
+            windowIDs = []
+        }
+
+        guard !windowIDs.isEmpty else {
+            return nil
+        }
+
+        self.displayID = CGDirectDisplayID(displayID)
+        self.windowIDs = windowIDs
+    }
+
+    var storageKey: String {
+        "\(displayID)|\(windowIDs.joined(separator: Self.windowSeparator))"
+    }
+}
 
 struct WindowGroupID: RawRepresentable, Hashable {
     var rawValue: String

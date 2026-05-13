@@ -335,7 +335,7 @@ final class WindowController {
             return []
         }
 
-        let array = unsafeBitCast(value, to: CFArray.self)
+        let array = unsafeDowncast(value, to: CFArray.self)
         let count = CFArrayGetCount(array)
         var elements: [AXUIElement] = []
         elements.reserveCapacity(count)

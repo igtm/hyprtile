@@ -9,7 +9,8 @@ Hyprtile は SwiftUI と AppKit で実装した macOS 15+ 向けの menu bar til
 - menu bar 常駐アプリ
 - Accessibility 権限の onboarding
 - display ごとの BSP tiling
-- `Tiling` / `Pause` / `Monocle`
+- `Tiling` / `Monocle` layout
+- `Pause` / `Resume` state
 - 通常ドラッグでの再配置
 - `Option` を押しながら drop すると上下 split
 - middle mouse drag による split resize
@@ -23,6 +24,8 @@ GitHub Releases から配布済み `.app` zip をダウンロードできます�
 2. 使用する Mac に合わせて asset を選ぶ
 3. zip を展開して `Hyprtile.app` を `Applications` へ移動する
 4. 初回起動後に `Accessibility` を許可する
+
+インストール後は menu bar の `About Hyprtile` と `Check for Updates...` から、現在の version 確認と GitHub Release からの app 内 update ができます。
 
 release asset 名:
 
