@@ -1,0 +1,116 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    name: prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_upload: ${{ steps.release_state.outputs.should_upload }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "${version}" ]; then
+            echo "ERROR: Failed to determine version from VERSION" >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+
+      - id: release_state
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+
+          if git rev-parse "${tag}" >/dev/null 2>&1; then
+            tag_sha="$(git rev-list -n 1 "${tag}")"
+            if [ "${tag_sha}" = "${GITHUB_SHA}" ]; then
+              echo "should_upload=true" >> "${GITHUB_OUTPUT}"
+              echo "Release tag ${tag} already points to ${GITHUB_SHA}; assets will be refreshed."
+            else
+              echo "should_upload=false" >> "${GITHUB_OUTPUT}"
+              echo "Release tag ${tag} already exists at ${tag_sha}; skipping release upload."
+            fi
+          else
+            echo "should_upload=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create release
+        if: steps.release_state.outputs.should_upload == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists."
+          else
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --generate-notes \
+              --target "${GITHUB_SHA}"
+          fi
+
+  release:
+    name: release ${{ matrix.target }}
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_upload == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release app bundle
+        run: scripts/package-macos-app.sh --version "${{ needs.prepare-release.outputs.version }}" --artifact-suffix "${{ matrix.target }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hyprtile-${{ matrix.target }}
+          path: dist/Hyprtile_v${{ needs.prepare-release.outputs.version }}_${{ matrix.target }}.zip
+          if-no-files-found: error
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload \
+            "${{ needs.prepare-release.outputs.tag }}" \
+            "dist/Hyprtile_v${{ needs.prepare-release.outputs.version }}_${{ matrix.target }}.zip" \
+            --clobber

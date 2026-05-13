@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build and package
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build debug binary
+        run: swift build
+
+      - name: Build release app bundle
+        run: scripts/package-macos-app.sh --artifact-suffix preview-aarch64-apple-darwin
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hyprtile-preview-aarch64-apple-darwin
+          path: dist/Hyprtile_v*.zip
+          if-no-files-found: error
