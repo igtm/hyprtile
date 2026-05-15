@@ -1,7 +1,9 @@
 import AppKit
+import OSLog
 
 @MainActor
 final class LayoutEngine {
+    private let logger = Logger(subsystem: "io.github.igtm.hyprtile", category: "LayoutEngine")
     struct ResizeSession {
         let node: LayoutNode
         let axis: SplitAxis
@@ -23,7 +25,8 @@ final class LayoutEngine {
     func rebuildSessions(
         with windows: [ManagedWindow],
         displays: [DisplayDescriptor],
-        persistedSnapshots: [LayoutSnapshotKey: PersistedLayoutNode] = [:]
+        persistedSnapshots: [LayoutSnapshotKey: PersistedLayoutNode] = [:],
+        skipCaching: Bool = false
     ) {
         let displaysByID = Dictionary(uniqueKeysWithValues: displays.map { ($0.displayID, $0) })
         let validDisplayIDs = Set(displaysByID.keys)
@@ -61,9 +64,11 @@ final class LayoutEngine {
             session.visibleFrame = display.visibleFrame
             session.focusedWindowID = focusedWindowID
 
-            if let previousKey = currentSnapshotKeys[display.displayID],
+            if !skipCaching,
+               let previousKey = currentSnapshotKeys[display.displayID],
                previousKey != snapshotKey,
                let currentRoot = session.root {
+                logger.info("rebuildSessions display=\(display.displayID, privacy: .public) key changed, caching previous root ids=\(previousKey.windowIDs.joined(separator: ","), privacy: .public)")
                 cachedRoots[previousKey] = currentRoot
             }
 
@@ -75,11 +80,21 @@ final class LayoutEngine {
 
             let restoredRoot: LayoutNode?
             if currentSnapshotKeys[display.displayID] == snapshotKey {
+                logger.info("rebuildSessions display=\(display.displayID, privacy: .public) key unchanged, reusing session root ids=\(snapshotKey.windowIDs.joined(separator: ","), privacy: .public)")
                 restoredRoot = session.root
             } else if let cachedRoot = cachedRoots[snapshotKey] {
+                logger.info("rebuildSessions display=\(display.displayID, privacy: .public) restoring from cachedRoots ids=\(snapshotKey.windowIDs.joined(separator: ","), privacy: .public) order=\(cachedRoot.orderedLeafIDs().joined(separator: ","), privacy: .public)")
                 restoredRoot = cachedRoot
+            } else if let fromPersisted = persistedSnapshots[snapshotKey].flatMap(LayoutNode.restore(from:)) {
+                logger.info("rebuildSessions display=\(display.displayID, privacy: .public) restoring from persisted ids=\(snapshotKey.windowIDs.joined(separator: ","), privacy: .public) order=\(fromPersisted.orderedLeafIDs().joined(separator: ","), privacy: .public)")
+                restoredRoot = fromPersisted
             } else {
-                restoredRoot = persistedSnapshots[snapshotKey].flatMap(LayoutNode.restore(from:))
+                // No cached/persisted layout for this window combination.
+                // Use the current session root as the base so existing split axes
+                // (e.g. horizontal splits created by Shift+drag) are preserved when
+                // new windows are added. syncTree will insert the new windows into it.
+                logger.info("rebuildSessions display=\(display.displayID, privacy: .public) no cache/persisted, extending current root ids=\(snapshotKey.windowIDs.joined(separator: ","), privacy: .public)")
+                restoredRoot = session.root
             }
 
             let syncedRoot = syncTree(
@@ -92,6 +107,7 @@ final class LayoutEngine {
             currentSnapshotKeys[display.displayID] = snapshotKey
 
             if let syncedRoot {
+                logger.info("rebuildSessions display=\(display.displayID, privacy: .public) final order=\(syncedRoot.orderedLeafIDs().joined(separator: ","), privacy: .public)")
                 cachedRoots[snapshotKey] = syncedRoot
             }
         }
@@ -135,6 +151,7 @@ final class LayoutEngine {
                   let root = session.root else {
                 continue
             }
+            logger.info("persistSnapshot display=\(displayID, privacy: .public) key=\(snapshotKey.windowIDs.joined(separator: ","), privacy: .public) order=\(root.orderedLeafIDs().joined(separator: ","), privacy: .public)")
             snapshots[snapshotKey] = root.snapshot()
         }
 
@@ -224,6 +241,89 @@ final class LayoutEngine {
         }
     }
 
+    func finalizeMove(for displayID: CGDirectDisplayID, allWindowIDs: [WindowID]) {
+        guard let session = sessions[displayID], let root = session.root else { return }
+        let rootWindowIDs = Set(root.orderedLeafIDs())
+        let expectedWindowIDs = Set(allWindowIDs)
+        let fullKey = LayoutSnapshotKey(displayID: displayID, windowIDs: allWindowIDs)
+        guard rootWindowIDs == expectedWindowIDs else {
+            logger.info("finalizeMove skipped display=\(displayID, privacy: .public) root=\(rootWindowIDs.sorted().joined(separator: ","), privacy: .public) expected=\(expectedWindowIDs.sorted().joined(separator: ","), privacy: .public)")
+            return
+        }
+        logger.info("finalizeMove display=\(displayID, privacy: .public) order=\(root.orderedLeafIDs().joined(separator: ","), privacy: .public) key=\(fullKey.windowIDs.joined(separator: ","), privacy: .public)")
+        cachedRoots[fullKey] = root
+        currentSnapshotKeys[displayID] = fullKey
+    }
+
+    func dropWindow(
+        _ windowID: WindowID,
+        at point: CGPoint,
+        on displayID: CGDirectDisplayID,
+        displays: [DisplayDescriptor],
+        allWindowIDsOnDisplay: [WindowID],
+        preferredSplitAxis: SplitAxis? = nil
+    ) {
+        guard let display = displays.first(where: { $0.displayID == displayID }),
+              let session = sessions[displayID] else {
+            logger.info("dropWindow FAILED no session display=\(displayID, privacy: .public)")
+            return
+        }
+
+        // Remove the window from any other display's BSP tree so cross-display drags don't
+        // leave a stale entry that competes with the new target-display placement in frames().
+        for (otherDisplayID, otherSession) in sessions where otherDisplayID != displayID {
+            guard let otherRoot = otherSession.root,
+                  otherRoot.leafNode(for: windowID) != nil else {
+                continue
+            }
+            let remainingIDs = Set(otherRoot.orderedLeafIDs()).subtracting([windowID])
+            otherSession.root = pruneTree(otherRoot, validWindowIDs: remainingIDs)
+            logger.info("dropWindow cross-display prune windowID=\(windowID, privacy: .public) from display=\(otherDisplayID, privacy: .public)")
+        }
+
+        // 2-window same-display drop: swap positions while keeping each window's own size.
+        // Swapping only the leaf IDs would put each window in the other's slot but with the
+        // other's size. We also flip the ratio (1 - r) so each window retains its original
+        // proportion: Split(0.2, A, B) → swap+flip → Split(0.8, B, A) → B=80%, A=20%.
+        if allWindowIDsOnDisplay.count == 2,
+           let existingRoot = session.root,
+           existingRoot.axis != nil,
+           existingRoot.orderedLeafIDs().count == 2,
+           let otherID = existingRoot.orderedLeafIDs().first(where: { $0 != windowID }),
+           let draggedLeaf = existingRoot.leafNode(for: windowID),
+           let otherLeaf = existingRoot.leafNode(for: otherID) {
+            draggedLeaf.windowID = otherID
+            otherLeaf.windowID = windowID
+            existingRoot.ratio = 1 - existingRoot.ratio
+            let fullKey = LayoutSnapshotKey(displayID: displayID, windowIDs: allWindowIDsOnDisplay)
+            if let root = session.root { cachedRoots[fullKey] = root }
+            currentSnapshotKeys[displayID] = fullKey
+            logger.info("dropWindow swap id=\(windowID, privacy: .public) ↔ \(otherID, privacy: .public) ratio=\(existingRoot.ratio, privacy: .public) display=\(displayID, privacy: .public)")
+            return
+        }
+
+        // Prune the dragged window from the full tree so stationary windows keep their
+        // original positions and sizes. Then insert only next to the drop target.
+        let stationaryIDs = Set(allWindowIDsOnDisplay).subtracting([windowID])
+        var root = pruneTree(session.root, validWindowIDs: stationaryIDs)
+
+        insertWindow(
+            windowID,
+            into: &root,
+            preferredFocusWindowID: nil,
+            preferredPoint: point,
+            visibleFrame: display.visibleFrame,
+            preferredSplitAxis: preferredSplitAxis
+        )
+
+        session.root = root
+
+        let fullKey = LayoutSnapshotKey(displayID: displayID, windowIDs: allWindowIDsOnDisplay)
+        if let root { cachedRoots[fullKey] = root }
+        currentSnapshotKeys[displayID] = fullKey
+        logger.info("dropWindow id=\(windowID, privacy: .public) display=\(displayID, privacy: .public) order=\(root?.orderedLeafIDs().joined(separator: ",") ?? "nil", privacy: .public)")
+    }
+
     func insertWindow(
         _ windowID: WindowID,
         at point: CGPoint,
@@ -232,6 +332,7 @@ final class LayoutEngine {
         preferredSplitAxis: SplitAxis? = nil
     ) {
         guard let display = displays.first(where: { $0.displayID == displayID }) else {
+            logger.info("insertWindow FAILED no display found id=\(windowID, privacy: .public) displayID=\(displayID, privacy: .public) availableDisplays=\(displays.map { $0.displayID.description }.joined(separator: ","), privacy: .public)")
             return
         }
 
@@ -240,6 +341,7 @@ final class LayoutEngine {
             visibleFrame: display.visibleFrame
         )
 
+        let rootBefore = session.root?.orderedLeafIDs().joined(separator: ",") ?? "nil"
         session.visibleFrame = display.visibleFrame
         var root = session.root
         insertWindow(
@@ -253,6 +355,8 @@ final class LayoutEngine {
         session.root = root
         session.focusedWindowID = windowID
         sessions[displayID] = session
+        let rootAfter = session.root?.orderedLeafIDs().joined(separator: ",") ?? "nil"
+        logger.info("insertWindow id=\(windowID, privacy: .public) display=\(displayID, privacy: .public) point=\(point.x, privacy: .public),\(point.y, privacy: .public) before=\(rootBefore, privacy: .public) after=\(rootAfter, privacy: .public)")
     }
 
     private func prioritizedWindows(_ windows: [ManagedWindow]) -> [ManagedWindow] {
@@ -296,7 +400,7 @@ final class LayoutEngine {
         return root
     }
 
-    private func buildTree(from windowIDs: [WindowID], visibleFrame: CGRect) -> LayoutNode? {
+    private func buildTree(from windowIDs: [WindowID], visibleFrame: CGRect, preferredSplitAxis: SplitAxis? = nil) -> LayoutNode? {
         guard let firstWindowID = windowIDs.first else {
             return nil
         }
@@ -309,7 +413,8 @@ final class LayoutEngine {
                 windowID,
                 into: &root,
                 preferredFocusWindowID: focusWindowID,
-                visibleFrame: visibleFrame
+                visibleFrame: visibleFrame,
+                preferredSplitAxis: preferredSplitAxis
             )
             focusWindowID = windowID
         }
@@ -370,7 +475,16 @@ final class LayoutEngine {
             if firstContainsFocused, !secondContainsFocused {
                 dividerX = overlappingChildren && firstPinnedToMinimum ? secondRect.minX : firstRect.maxX
             } else if secondContainsFocused {
-                dividerX = secondRect.minX
+                // Use the preferred window's left edge directly to avoid being misled by
+                // sibling windows in the subtree that haven't moved yet (their minX would
+                // dominate the union rect, causing the ratio to not update on shrink).
+                if let preferredID = preferredWindowID,
+                   let preferredFrame = windowsByID[preferredID]?.frame,
+                   second.leafNode(for: preferredID) != nil {
+                    dividerX = preferredFrame.minX
+                } else {
+                    dividerX = secondRect.minX
+                }
             } else {
                 dividerX = secondRect.minX
             }
@@ -446,6 +560,7 @@ final class LayoutEngine {
         preferredSplitAxis: SplitAxis? = nil
     ) {
         guard let existingRoot = root else {
+            logger.info("insertWindow(private) existingRoot=nil → leaf only id=\(windowID, privacy: .public)")
             root = LayoutNode(windowID: windowID)
             return
         }
@@ -459,12 +574,14 @@ final class LayoutEngine {
             preferredPoint: preferredPoint
         )
         guard let leaf = targetLeaf else {
+            logger.info("insertWindow(private) targetLeaf=nil → replacing root with id=\(windowID, privacy: .public) existingRoot=\(existingRoot.orderedLeafIDs().joined(separator: ","), privacy: .public) point=\(preferredPoint?.x ?? 0, privacy: .public),\(preferredPoint?.y ?? 0, privacy: .public) framesCount=\(currentFrames.count, privacy: .public)")
             root = LayoutNode(windowID: windowID)
             return
         }
+        logger.info("insertWindow(private) targetLeaf=\(leaf.windowID ?? "branch", privacy: .public) id=\(windowID, privacy: .public)")
 
         let targetFrame = leaf.windowID.flatMap { currentFrames[$0] } ?? visibleFrame
-        let splitAxis = preferredSplitAxis ?? (targetFrame.width >= targetFrame.height ? .vertical : .horizontal)
+        let splitAxis = preferredSplitAxis ?? SplitAxis.vertical
         let previousParent = leaf.parent
         let leafWasFirstChild = previousParent?.first === leaf
         let dropBeforeTarget = insertionPrefersLeadingHalf(

@@ -90,6 +90,12 @@ private struct MenuBarContent: View {
             controller.openSettings()
         }
 
+        Divider()
+
+        Button("Uninstall Hyprtile...") {
+            controller.openUninstaller()
+        }
+
         Button("Quit") {
             controller.quit()
         }

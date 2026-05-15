@@ -15,6 +15,7 @@ final class AppController: ObservableObject {
     @Published private(set) var launchAtLoginEnabled = false
     @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var updateStatusText = "Update status: not checked yet."
+    @Published private(set) var uninstallPhase: UninstallPhase = .idle
 
     let settingsStore: SettingsStore
     let permissionMonitor: PermissionMonitor
@@ -35,6 +36,7 @@ final class AppController: ObservableObject {
     private var externalChangeTimer: Timer?
     private var settingsWindowController: NSWindowController?
     private var aboutWindowController: NSWindowController?
+    private var uninstallerWindowController: NSWindowController?
 
     private var activeMove: MoveOperation?
     private var activeResize: ResizeOperation?
@@ -311,6 +313,69 @@ final class AppController: ObservableObject {
         NSApp.terminate(nil)
     }
 
+    func openUninstaller() {
+        uninstallPhase = .idle
+        let wc = configuredUninstallerWindowController()
+        guard let window = wc.window else { return }
+
+        logger.info("Opening uninstaller window")
+        DispatchQueue.main.async {
+            if let hc = window.contentViewController as? NSHostingController<UninstallerView> {
+                hc.rootView = UninstallerView(controller: self)
+            }
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            NSRunningApplication.current.activate(options: [.activateAllWindows])
+            NSApp.activate(ignoringOtherApps: true)
+            window.orderFrontRegardless()
+            window.makeMain()
+            window.makeKey()
+        }
+    }
+
+    func closeUninstallerWindow() {
+        uninstallerWindowController?.close()
+    }
+
+    func openPrivacyAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    func startUninstall() {
+        Task { @MainActor in
+            let fm = FileManager.default
+            let bundleID = AppMetadata.bundleIdentifier
+
+            uninstallPhase = .running(step: "Unregistering Launch at Login…")
+            try? await SMAppService.mainApp.unregister()
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            uninstallPhase = .running(step: "Removing preferences…")
+            UserDefaults.standard.removePersistentDomain(forName: bundleID)
+            UserDefaults.standard.synchronize()
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            uninstallPhase = .running(step: "Removing application data…")
+            if let libraryURL = fm.urls(for: .libraryDirectory, in: .userDomainMask).first {
+                let candidates = [
+                    libraryURL.appendingPathComponent("Application Support/\(bundleID)"),
+                    libraryURL.appendingPathComponent("Caches/\(bundleID)"),
+                    libraryURL.appendingPathComponent("Preferences/\(bundleID).plist"),
+                ]
+                candidates.forEach { try? fm.removeItem(at: $0) }
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            uninstallPhase = .running(step: "Moving Hyprtile to Trash…")
+            let appURL = Bundle.main.bundleURL
+            if appURL.pathExtension == "app" {
+                try? fm.trashItem(at: appURL, resultingItemURL: nil)
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+
+            uninstallPhase = .needsAccessibilityCleanup
+        }
+    }
+
     private func presentOnboardingIfNeeded() {
         guard !permissionState.isReady, !settingsStore.hasShownPermissionSetup else {
             return
@@ -357,6 +422,25 @@ final class AppController: ObservableObject {
         let settingsWindowController = NSWindowController(window: settingsWindow)
         self.settingsWindowController = settingsWindowController
         return settingsWindowController
+    }
+
+    private func configuredUninstallerWindowController() -> NSWindowController {
+        if let uninstallerWindowController { return uninstallerWindowController }
+
+        let hostingController = NSHostingController(rootView: UninstallerView(controller: self))
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "Uninstall Hyprtile"
+        window.styleMask = [.titled, .closable]
+        window.isReleasedWhenClosed = false
+        window.hidesOnDeactivate = false
+        window.isExcludedFromWindowsMenu = false
+        window.tabbingMode = .disallowed
+        window.center()
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+
+        let wc = NSWindowController(window: window)
+        self.uninstallerWindowController = wc
+        return wc
     }
 
     private func configuredAboutWindowController() -> NSWindowController {
@@ -537,6 +621,13 @@ final class AppController: ObservableObject {
             return
         }
 
+        // Guard against stale delayed refreshes that were queued before a drag started.
+        // manualMode (Retile Now) is always allowed through.
+        guard !isInteracting || manualMode != nil else {
+            logger.debug("Skipping stale refresh during interaction reason=\(reason, privacy: .public)")
+            return
+        }
+
         _ = reason
         logger.debug(
             "Refreshing reason=\(reason, privacy: .public) rebuildTree=\(rebuildTree, privacy: .public) mode=\((manualMode ?? mode).rawValue, privacy: .public)"
@@ -621,9 +712,11 @@ final class AppController: ObservableObject {
                 continue
             }
 
+            // Call setFrame before updating window.frame so the animation starts
+            // from the window's actual current position, not the target.
+            windowController.setFrame(frame, for: window, animated: animated)
             window.frame = frame
             updatedWindowsByID[windowID] = window
-            windowController.setFrame(frame, for: window, animated: animated)
         }
 
         visibleWindowsByID = updatedWindowsByID
@@ -791,6 +884,7 @@ final class AppController: ObservableObject {
         if movedWindows.count == 1, let movedWindow = movedWindows.first {
             let operation = ExternalMoveOperation(
                 windowID: movedWindow.id,
+                element: movedWindow.element,
                 lastObservedFrame: movedWindow.frame,
                 lastMovementAt: Date(),
                 preferredSplitAxis: preferredExternalMoveSplitAxis()
@@ -821,11 +915,30 @@ final class AppController: ObservableObject {
         liveWindows: [ManagedWindow],
         liveWindowsByID: [WindowID: ManagedWindow]
     ) {
-        guard let movedWindow = liveWindowsByID[operation.windowID] else {
+        var movedWindow = liveWindowsByID[operation.windowID]
+        if movedWindow == nil {
+            // ID may have changed between stable (cgWindowID) and synthetic (AXElement hash).
+            // Fall back to element identity so we don't lose the drag mid-flight.
+            if let found = liveWindows.first(where: { CFEqual($0.element, operation.element) }) {
+                logger.info("externalMove windowID changed \(operation.windowID, privacy: .public) → \(found.id, privacy: .public)")
+                externalMove = ExternalMoveOperation(
+                    windowID: found.id,
+                    element: found.element,
+                    lastObservedFrame: operation.lastObservedFrame,
+                    lastMovementAt: operation.lastMovementAt,
+                    preferredSplitAxis: operation.preferredSplitAxis
+                )
+                movedWindow = found
+            }
+        }
+        guard let movedWindow else {
             externalMove = nil
             scheduleRefresh(reason: "external move lost", immediate: true, rebuildTree: true)
             return
         }
+
+        // Cancel any in-flight animation for the dragged window (keyed by element to handle ID changes).
+        windowController.cancelAnimation(for: movedWindow.element)
 
         let now = Date()
         let frameChanged = frameOriginDiffers(movedWindow.frame, operation.lastObservedFrame, tolerance: 8)
@@ -834,40 +947,46 @@ final class AppController: ObservableObject {
         if frameChanged {
             externalMove = ExternalMoveOperation(
                 windowID: movedWindow.id,
+                element: movedWindow.element,
                 lastObservedFrame: movedWindow.frame,
                 lastMovementAt: now,
                 preferredSplitAxis: operation.preferredSplitAxis ?? preferredExternalMoveSplitAxis()
             )
         }
 
-        let displays = windowController.displays()
-        let stationaryWindows = liveWindows.filter { $0.id != movedWindow.id }
-        let stationaryWindowsByID = Dictionary(uniqueKeysWithValues: stationaryWindows.map { ($0.id, $0) })
-
-        visibleWindowsByID = liveWindowsByID
-        layoutEngine.rebuildSessions(with: stationaryWindows, displays: displays)
-        let stationaryFrames = layoutEngine.frames(for: .tiling, displays: displays, windowsByID: liveWindowsByID)
-        applyFrames(stationaryFrames, windowsByID: liveWindowsByID, mode: .tiling, animated: true)
-
+        // While the mouse is held, leave all stationary windows untouched (no resize, no move).
+        // Only apply frames at drop time.
         guard !isPrimaryMouseButtonDown else {
             return
         }
 
+        // --- Drop ---
         externalMove = nil
         visibleWindowsByID = liveWindowsByID
-        layoutEngine.rebuildSessions(with: stationaryWindows, displays: displays)
-        layoutEngine.insertWindow(
+
+        let displays = windowController.displays()
+        let dropPoint = currentMouseLocationInAccessibilityCoords
+        // Use mouse position to determine the target display so that cross-display drags
+        // land on the correct display even when the window's reported displayID still
+        // reflects the source display at the moment of enumeration.
+        let targetDisplayID = windowController.nearestDisplay(to: dropPoint)?.displayID ?? movedWindow.displayID
+        var windowIDsOnDisplay = liveWindowsByID.values.filter { $0.displayID == targetDisplayID }.map(\.id)
+        if !windowIDsOnDisplay.contains(movedWindow.id) {
+            windowIDsOnDisplay.append(movedWindow.id)
+        }
+        layoutEngine.dropWindow(
             movedWindow.id,
-            at: frameCenter(movedWindow.frame),
-            on: movedWindow.displayID,
+            at: dropPoint,
+            on: targetDisplayID,
             displays: displays,
+            allWindowIDsOnDisplay: windowIDsOnDisplay,
             preferredSplitAxis: operation.preferredSplitAxis ?? preferredExternalMoveSplitAxis()
         )
         persistLayoutSnapshots()
 
-        let mergedWindowsByID = stationaryWindowsByID.merging([movedWindow.id: movedWindow]) { _, rhs in rhs }
-        let finalFrames = layoutEngine.frames(for: .tiling, displays: displays, windowsByID: mergedWindowsByID)
-        applyFrames(finalFrames, windowsByID: mergedWindowsByID, mode: .tiling, animated: true)
+        let finalFrames = layoutEngine.frames(for: .tiling, displays: displays, windowsByID: liveWindowsByID)
+        logger.info("drop movedWindow=\(movedWindow.id, privacy: .public) display=\(targetDisplayID, privacy: .public) frames=\(finalFrames.count, privacy: .public)")
+        applyFrames(finalFrames, windowsByID: liveWindowsByID, mode: .tiling, animated: true)
     }
 }
 
@@ -884,6 +1003,7 @@ private extension AppController {
 
     struct ExternalMoveOperation {
         let windowID: WindowID
+        let element: AXUIElement
         let lastObservedFrame: CGRect
         let lastMovementAt: Date
         let preferredSplitAxis: SplitAxis?
@@ -913,11 +1033,19 @@ private extension AppController {
         (NSEvent.pressedMouseButtons & 1) == 1
     }
 
+    var currentMouseLocationInAccessibilityCoords: CGPoint {
+        let cocoaLocation = NSEvent.mouseLocation
+        let referenceMaxY = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.maxY
+            ?? NSScreen.main?.frame.maxY
+            ?? 0
+        return CGPoint(x: cocoaLocation.x, y: referenceMaxY - cocoaLocation.y)
+    }
+
     func preferredExternalMoveSplitAxis() -> SplitAxis? {
         let modifierFlags = NSEvent.ModifierFlags(
             rawValue: UInt(CGEventSource.flagsState(.combinedSessionState).rawValue)
         )
-        return modifierFlags.contains(NSEvent.ModifierFlags.option) ? .horizontal : nil
+        return modifierFlags.contains(NSEvent.ModifierFlags.shift) ? .horizontal : nil
     }
 
     func automaticExternalMoveOperation(from liveWindows: [ManagedWindow]) -> ExternalMoveOperation? {
@@ -944,6 +1072,7 @@ private extension AppController {
 
         return ExternalMoveOperation(
             windowID: movedWindow.id,
+            element: movedWindow.element,
             lastObservedFrame: movedWindow.frame,
             lastMovementAt: Date(),
             preferredSplitAxis: preferredExternalMoveSplitAxis()

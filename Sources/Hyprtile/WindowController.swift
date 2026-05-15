@@ -398,22 +398,10 @@ final class WindowController {
     }
 
     private func syntheticWindowID(for element: AXUIElement, pid: pid_t, title: String, frame: CGRect) -> String {
-        let roundedFrame = CGRect(
-            x: frame.origin.x.rounded(.towardZero),
-            y: frame.origin.y.rounded(.towardZero),
-            width: frame.width.rounded(.towardZero),
-            height: frame.height.rounded(.towardZero)
-        )
-
-        return [
-            String(pid),
-            title,
-            String(Int(roundedFrame.origin.x)),
-            String(Int(roundedFrame.origin.y)),
-            String(Int(roundedFrame.width)),
-            String(Int(roundedFrame.height)),
-            String(CFHash(element)),
-        ].joined(separator: ":")
+        // Exclude position so the ID stays stable while the window is being dragged.
+        // CFHash(element) is content-based equality for AXUIElement (same window → same hash).
+        _ = frame
+        return "\(title):\(String(CFHash(element), radix: 16))"
     }
 
     private func copyPoint(_ element: AXUIElement, attribute: CFString) -> CGPoint? {
@@ -505,8 +493,19 @@ final class WindowController {
         }
     }
 
-    private func cancelAnimation(for windowID: WindowID) {
+    func cancelAnimation(for windowID: WindowID) {
         frameAnimations.removeValue(forKey: windowID)
+        if frameAnimations.isEmpty {
+            animationTimer?.invalidate()
+            animationTimer = nil
+        }
+    }
+
+    func cancelAnimation(for element: AXUIElement) {
+        let keysToRemove = frameAnimations.compactMap { key, anim in
+            CFEqual(anim.element, element) ? key : nil
+        }
+        keysToRemove.forEach { frameAnimations.removeValue(forKey: $0) }
         if frameAnimations.isEmpty {
             animationTimer?.invalidate()
             animationTimer = nil

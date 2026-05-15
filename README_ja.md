@@ -2,9 +2,9 @@
 
 [English README](./README.md)
 
-Hyprtile は SwiftUI と AppKit で実装した macOS 15+ 向けの menu bar tiling window manager です。現在のバージョンは `0.0.1` です。
+Hyprtile は SwiftUI と AppKit で実装した macOS 15+ 向けの menu bar tiling window manager です。現在のバージョンは `0.0.3` です。
 
-## v0.0.1 scope
+## Current scope
 
 - menu bar 常駐アプリ
 - Accessibility 権限の onboarding
@@ -12,7 +12,7 @@ Hyprtile は SwiftUI と AppKit で実装した macOS 15+ 向けの menu bar til
 - `Tiling` / `Monocle` layout
 - `Pause` / `Resume` state
 - 通常ドラッグでの再配置
-- `Option` を押しながら drop すると上下 split
+- `Shift` を押しながら drop すると上下 split
 - middle mouse drag による split resize
 - launch at login 登録
 
@@ -29,8 +29,8 @@ GitHub Releases から配布済み `.app` zip をダウンロードできます�
 
 release asset 名:
 
-- `Hyprtile_v0.0.1_aarch64-apple-darwin.zip`
-- `Hyprtile_v0.0.1_x86_64-apple-darwin.zip`
+- `Hyprtile_v0.0.3_aarch64-apple-darwin.zip`
+- `Hyprtile_v0.0.3_x86_64-apple-darwin.zip`
 
 ## 開発
 
@@ -45,7 +45,7 @@ menu bar 配布挙動と launch-at-login の確認には、packaged app bundle �
 scripts/package-macos-app.sh
 ```
 
-生成物は `dist/Hyprtile.app` と `dist/Hyprtile_v0.0.1_<target>.zip` に出ます。
+生成物は `dist/Hyprtile.app` と `dist/Hyprtile_v0.0.3_<target>.zip` に出ます。
 
 ## リリース自動化
 

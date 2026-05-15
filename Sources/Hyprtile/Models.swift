@@ -1,5 +1,11 @@
 import AppKit
 
+enum UninstallPhase {
+    case idle
+    case running(step: String)
+    case needsAccessibilityCleanup
+}
+
 enum AppMode: String, CaseIterable {
     case tiling
     case monocle
